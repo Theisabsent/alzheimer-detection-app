@@ -12,64 +12,102 @@ IMG_SIZE = 224
 classes = ["Nondemented", "Verymilddemented",
            "MildDemented", "Moderatedemented"]
 
-
 @st.cache_resource
 def load_models():
     svm = joblib.load("svm_local.pkl")
-    pca = joblib.load("pca_local.pkl")
+    pca = joblib.load("pca_local_zlib.pkl")
+    # VGG16 expects (224, 224, 3)
     base_model = VGG16(weights="imagenet", include_top=False,
                        input_shape=(224, 224, 3))
     vgg = Model(inputs=base_model.input, outputs=base_model.output)
     return svm, pca, vgg
 
+def is_valid_mri(img_array):
+    """
+    Checks if the image is likely an MRI (grayscale-ish) vs a normal colored photo.
+    """
+    # 1. Convert to float for calculation
+    img_float = img_array.astype(np.float32)
+    
+    # 2. Split channels
+    b, g, r = cv2.split(img_float)
+    
+    # 3. Calculate mean absolute difference between channels
+    # In a true grayscale/MRI image, R, G, and B are almost identical.
+    diff_rg = np.mean(np.abs(r - g))
+    diff_gb = np.mean(np.abs(g - b))
+    
+    # Threshold: If the average difference between channels is > 8-10, it's likely a color photo.
+    if diff_rg > 10 or diff_gb > 10:
+        return False
+    return True
 
-st.title("🧠 Alzheimer's Detection App (Local Trained Model)")
-st.write("Upload an MRI brain image for dementia stage prediction.")
+st.set_page_config(page_title="Alzheimer's Detection", page_icon="🧠")
+st.title("🧠 Alzheimer's Detection App")
+st.write("Upload a **Brain MRI** image (Grayscale) for dementia stage prediction.")
 
 uploaded_file = st.file_uploader(
     "Choose MRI image...", type=["jpg", "png", "jpeg"])
 
 if uploaded_file is not None:
-    image = Image.open(uploaded_file)
+    # --- STEP 1: LOAD AND NORMALIZE CHANNELS ---
+    # .convert('RGB') ensures that even grayscale JPEGs are read as 3-channel (R=G=B)
+    image = Image.open(uploaded_file).convert('RGB')
     st.image(image, caption="Uploaded Image", use_column_width=True)
 
-    # Convert PIL to cv2
+    # Convert PIL to cv2 (BGR)
     img_array = np.array(image)
-    if len(img_array.shape) == 3 and img_array.shape[2] == 4:
-        img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
     img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
-    img = cv2.resize(img_array, (IMG_SIZE, IMG_SIZE))
-    img = img / 255.0
-    img_array = np.expand_dims(img, axis=0)
+    # --- STEP 2: MRI VALIDATION GATE ---
+    if not is_valid_mri(img_array):
+        st.error("❌ **Invalid Image Detected.** This model is designed for Brain MRI scans only. Please upload a grayscale MRI image.")
+    else:
+        # --- STEP 3: PRE-PROCESSING ---
+        img = cv2.resize(img_array, (IMG_SIZE, IMG_SIZE))
+        img = img / 255.0
+        img_input = np.expand_dims(img, axis=0)
 
-    svm_model, pca_model, vgg_model = load_models()
+        svm_model, pca_model, vgg_model = load_models()
 
-    with st.spinner("Extracting features and predicting..."):
-        features = vgg_model.predict(img_array)
-        features = features.reshape(1, -1)
-        features_pca = pca_model.transform(features)
-        prediction = svm_model.predict(features_pca)
-        probability = svm_model.predict_proba(features_pca)[0]
+        with st.spinner("Extracting features and predicting..."):
+            # Feature extraction using VGG16
+            features = vgg_model.predict(img_input)
+            features = features.reshape(1, -1)
+            
+            # Dimensionality reduction
+            features_pca = pca_model.transform(features)
+            
+            # Classification
+            prediction = svm_model.predict(features_pca)
+            probability = svm_model.predict_proba(features_pca)[0]
 
-    st.subheader("📊 Prediction Results")
-    predicted_class = classes[prediction[0]]
-    st.success(f"**Predicted Stage: {predicted_class}**")
+        # --- STEP 4: RESULTS ---
+        st.subheader("📊 Prediction Results")
+        predicted_class = classes[prediction[0]]
+        st.success(f"**Predicted Stage: {predicted_class}**")
 
-    st.subheader("📈 Confidence Scores")
-    for i, (label, prob) in enumerate(zip(classes, probability)):
-        st.write(f"**{label}:** {prob*100:.1f}%")
+        st.subheader("📈 Confidence Scores")
+        # Create columns for better layout
+        cols = st.columns(len(classes))
+        for i, (label, prob) in enumerate(zip(classes, probability)):
+            cols[i].metric(label, f"{prob*100:.1f}%")
 
-    fig, ax = plt.subplots()
-    bars = ax.bar(classes, probability*100,
-                  color=['green', 'orange', 'red', 'darkred'])
-    ax.set_ylabel("Probability (%)")
-    ax.set_title("Model Confidence")
-    ax.set_ylim(0, 100)
-    for bar, prob in zip(bars, probability):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.1f}%', ha='center', va='bottom')
-    st.pyplot(fig)
+        # Visualizing with Matplotlib
+        fig, ax = plt.subplots(figsize=(8, 4))
+        colors = ['#2ecc71', '#f1c40f', '#e67e22', '#e74c3c'] # Green to Red
+        bars = ax.bar(classes, probability*100, color=colors)
+        
+        ax.set_ylabel("Probability (%)")
+        ax.set_title("Model Confidence Distribution")
+        ax.set_ylim(0, 100)
+        
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + 1,
+                    f'{height:.1f}%', ha='center', va='bottom')
+        
+        st.pyplot(fig)
 
-st.info("💡 Model trained on your local dataset. Retrain with `python train_local.py` for updates.")
+st.divider()
+st.info("💡 Note: This tool uses a VGG16+SVM pipeline. High confidence in 'Nondemented' for a non-brain image is avoided by the color-check filter.")
